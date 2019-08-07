@@ -134,6 +134,10 @@ void reload_shaders(ComPtr<ID3D12Device> device, ComPtr<ID3D12RootSignature> roo
 	}
 }
 
+struct Constant_buffer {
+	float t;
+};
+
 int main() {
 	long long _freq;
 	bool has_perf_counter = QueryPerformanceFrequency((LARGE_INTEGER*)&_freq);
@@ -284,9 +288,23 @@ int main() {
 
 	// root signature
 
+	D3D12_DESCRIPTOR_RANGE desc_table_ranges[1];
+	desc_table_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+	desc_table_ranges[0].NumDescriptors = 1;
+	desc_table_ranges[0].BaseShaderRegister = 0;
+	desc_table_ranges[0].RegisterSpace = 0;
+	desc_table_ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	
+	D3D12_ROOT_DESCRIPTOR_TABLE desc_table;
+	desc_table.NumDescriptorRanges = 1;
+	desc_table.pDescriptorRanges = desc_table_ranges;
+
 	// We have two root parameters, one is a pointer to a descriptor heap with a SRV, the second is a constant buffer view
 	CD3DX12_ROOT_PARAMETER parameters[1];
-	parameters[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_VERTEX);  // Our constant buffer view
+	//parameters[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_VERTEX);  // Our constant buffer view
+	parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	parameters[0].DescriptorTable = desc_table;
+	parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 	CD3DX12_ROOT_SIGNATURE_DESC descRootSignature;
 	descRootSignature.Init(1, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
@@ -299,6 +317,56 @@ int main() {
 
 	ID3D12PipelineState* pso;
 	create_pso(device, root_signature, &pso);
+
+
+
+
+	// constant buffer stuff
+
+	ID3D12DescriptorHeap* desc_heaps[BUFFER_COUNT]; // this heap will store the descripor to our constant buffer
+	ID3D12Resource* constant_buffer_upload_heap[BUFFER_COUNT]; // this is the memory on the gpu where our constant buffer will be placed.
+	UINT8* constant_buffer_mappings[BUFFER_COUNT]; // this is a pointer to the memory location we get when we map our constant buffer
+
+	// Create a constant buffer descriptor heap for each frame
+	// this is the descriptor heap that will store our constant buffer descriptor
+	for (int i = 0; i < BUFFER_COUNT ; i++) {
+		D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+		heapDesc.NumDescriptors = 1;
+		heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		check_hr(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&desc_heaps[i])));
+	}
+
+	// create the constant buffer resource heap
+	// We will update the constant buffer one or more times per frame, so we will use only an upload heap
+	// unlike previously we used an upload heap to upload the vertex and index data, and then copied over
+	// to a default heap. If you plan to use a resource for more than a couple frames, it is usually more
+	// efficient to copy to a default heap where it stays on the gpu. In this case, our constant buffer
+	// will be modified and uploaded at least once per frame, so we only use an upload heap
+
+	// create a resource heap, descriptor heap, and pointer to cbv for each frame
+	for (int i = 0; i < BUFFER_COUNT; i++) {
+		check_hr(device->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), // this heap will be used to upload the constant buffer data
+			D3D12_HEAP_FLAG_NONE, // no flags
+			&CD3DX12_RESOURCE_DESC::Buffer(1024 * 64), // size of the resource heap. Must be a multiple of 64KB for single-textures and constant buffers
+			D3D12_RESOURCE_STATE_GENERIC_READ, // will be data that is read from so we keep it in the generic read state
+			nullptr, // we do not have use an optimized clear value for constant buffers
+			IID_PPV_ARGS(&constant_buffer_upload_heap[i])));
+		constant_buffer_upload_heap[i]->SetName(L"Constant Buffer Upload Resource Heap");
+
+		D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+		cbvDesc.BufferLocation = constant_buffer_upload_heap[i]->GetGPUVirtualAddress();
+		cbvDesc.SizeInBytes = (sizeof(Constant_buffer) + 255) & ~255;    // CB size is required to be 256-byte aligned.
+		device->CreateConstantBufferView(&cbvDesc, desc_heaps[i]->GetCPUDescriptorHandleForHeapStart());
+
+		CD3DX12_RANGE readRange(0, 0);    // We do not intend to read from this resource on the CPU. (End is less than or equal to begin)
+		check_hr(constant_buffer_upload_heap[i]->Map(0, &readRange, reinterpret_cast<void**>(&constant_buffer_mappings[i])));
+		//ZeroMemory(&cbColorMultiplierData, sizeof(cbColorMultiplierData));
+		//memcpy(constant_buffer_mappings[i], &cbColorMultiplierData, sizeof(cbColorMultiplierData));
+	}
+
+
 
 
 	// mesh buffers
@@ -436,8 +504,7 @@ int main() {
 		cmd_allocators[current_back_buffer]->Reset();
 
 		auto commandList = cmd_lists[current_back_buffer].Get();
-		commandList->Reset(
-			cmd_allocators[current_back_buffer].Get(), nullptr);
+		check_hr(commandList->Reset(cmd_allocators[current_back_buffer].Get(), nullptr));
 
 		D3D12_CPU_DESCRIPTOR_HANDLE renderTargetHandle;
 		CD3DX12_CPU_DESCRIPTOR_HANDLE::InitOffsetted(renderTargetHandle,
@@ -471,6 +538,18 @@ int main() {
 		auto cmd_list = cmd_lists[current_back_buffer].Get();
 		cmd_list->SetPipelineState(pso);
 		cmd_list->SetGraphicsRootSignature(root_signature.Get());
+
+		// set constant buffer descriptor heap
+		ID3D12DescriptorHeap* descriptorHeaps[] = { desc_heaps[current_back_buffer] };
+		commandList->SetDescriptorHeaps(1, descriptorHeaps);
+
+		// set the root descriptor table 0 to the constant buffer descriptor heap
+		commandList->SetGraphicsRootDescriptorTable(0, desc_heaps[current_back_buffer]->GetGPUDescriptorHandleForHeapStart());
+
+		Constant_buffer cb;
+		cb.t = (float)t;
+		memcpy(constant_buffer_mappings[current_back_buffer], &cb, sizeof(Constant_buffer));
+
 		cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		cmd_list->IASetVertexBuffers(0, 1, &vertex_buffer_view);
 		cmd_list->IASetIndexBuffer(&index_buffer_view);

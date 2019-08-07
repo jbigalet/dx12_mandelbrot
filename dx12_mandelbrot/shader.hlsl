@@ -13,6 +13,11 @@ VertexShaderOutput VS_main(float4 position : POSITION, float2 uv : TEXCOORD) {
 }
 
 
+
+cbuffer ConstantBuffer : register(b0) {
+	float t;
+};
+
 #define CONTINUOUS
 
 static const int MAX_IT = 1000;
@@ -59,9 +64,15 @@ float4 PS_main (float4 position : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET
 	//float x_min = -2.1f, x_max = 0.9f;
 	//float y_min = -1.5f, y_max = 1.5f;
 
-#if 0
+#if 1
 	float2 center = float2(-0.74526f, -0.09977f);
-	float scaling = 0.00001f;  // base is -1:1
+	//const float min_scaling = 1.5f, max_scaling = 0.00001f;
+	const float min_scaling = 2.f;
+	const float scaling_per_sec = 0.5f;
+	const float total_scaling_time = 17.f;
+	float T = fmod(t, total_scaling_time*2);
+	if (T > total_scaling_time) T = T-2*(T-total_scaling_time);
+	float scaling = min_scaling * pow(scaling_per_sec, fmod(T, total_scaling_time));
 #else
 	float2 center = float2(-0.6f, 0.f);
 	float scaling = 1.5f;  // base is -1:1
