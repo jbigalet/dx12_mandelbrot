@@ -27,44 +27,28 @@ void check_hr(HRESULT hr) {
 	assert(!FAILED(hr));
 }
 
+long long time_init = 0;
+double freq = 1;
+double get_time() {
+	long long t;
+	QueryPerformanceCounter((LARGE_INTEGER*)&t);
+	return (t - time_init) / freq;
+}
+
+bool should_close = false;
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 	//auto ptr = GetWindowLongPtr(hwnd, GWLP_USERDATA);
 	
 	switch (uMsg) {
-	case WM_CLOSE:
-		exit(1);
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		should_close = true;
 		return 0;
 	}
 
 	return DefWindowProcA(hwnd, uMsg, wParam, lParam);
 }
-
-const char Shaders[] =
-"struct VertexShaderOutput\n"
-"{\n"
-"	float4 position : SV_POSITION;\n"
-"	float2 uv : TEXCOORD;\n"
-"};\n"
-"\n"
-"VertexShaderOutput VS_main(\n"
-"	float4 position : POSITION,\n"
-"	float2 uv : TEXCOORD)\n"
-"{\n"
-"	VertexShaderOutput output;\n"
-"\n"
-"	output.position = position;\n"
-"	output.uv = uv;\n"
-"\n"
-"	return output;\n"
-"}\n"
-"\n"
-"float4 PS_main (float4 position : SV_POSITION,\n"
-"				float2 uv : TEXCOORD) : SV_TARGET\n"
-"{\n"
-"	return float4(uv, 0, 1);\n"
-"}\n"
-;
 
 void wait_for_fence(ID3D12Fence* fence, UINT64 completion_value, HANDLE wait_event) {
 	if (fence->GetCompletedValue() < completion_value) {
@@ -73,38 +57,119 @@ void wait_for_fence(ID3D12Fence* fence, UINT64 completion_value, HANDLE wait_eve
 	}
 }
 
-int main() {
-    std::cout << "Hello World!\n"; 
+bool compile_shader(LPCWSTR filename, LPCSTR entrypoint, LPCSTR type, ID3DBlob** out) {
+	ID3DBlob* error_blob = NULL;
+	ID3DBlob* shader_blob = NULL;
+	int shader_flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_DEBUG;
+	HRESULT hr = D3DCompileFromFile(filename, NULL, NULL, entrypoint, type, shader_flags, 0, &shader_blob, &error_blob);
 
-	//
+	if (FAILED(hr)) {
+		if (error_blob) {
+			printf("error compiling vs: %s\n", (char*)error_blob->GetBufferPointer());
+			error_blob->Release();
+		} else {
+			printf("unknown error compiling vs\n");
+		}
+		return false;
+	}
+	*out = shader_blob;
+	return true;
+}
+
+void create_pso(ComPtr<ID3D12Device> device, ComPtr<ID3D12RootSignature> root_signature, ID3D12PipelineState** pso) {
+	ID3DBlob *vertex_shader, *pixel_shader;
+	while (!compile_shader(L"shader.hlsl", "VS_main", "vs_5_0", &vertex_shader))
+		Sleep(1000);
+	while (!compile_shader(L"shader.hlsl", "PS_main", "ps_5_0", &pixel_shader))
+		Sleep(1000);
+
+	static const D3D12_INPUT_ELEMENT_DESC layout[] = {
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+	};
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.VS.BytecodeLength = vertex_shader->GetBufferSize();
+	psoDesc.VS.pShaderBytecode = vertex_shader->GetBufferPointer();
+	psoDesc.PS.BytecodeLength = pixel_shader->GetBufferSize();
+	psoDesc.PS.pShaderBytecode = pixel_shader->GetBufferPointer();
+	psoDesc.pRootSignature = root_signature.Get();
+	psoDesc.NumRenderTargets = 1;
+	psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+	psoDesc.InputLayout.NumElements = std::extent<decltype(layout)>::value;
+	psoDesc.InputLayout.pInputElementDescs = layout;
+	psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+	psoDesc.BlendState.RenderTarget[0].BlendEnable = false;
+	//psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+	//psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+	//psoDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+	//psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+	//psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+	//psoDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	//psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	psoDesc.SampleDesc.Count = 1;
+	psoDesc.DepthStencilState.DepthEnable = false;
+	psoDesc.DepthStencilState.StencilEnable = false;
+	psoDesc.SampleMask = 0xFFFFFFFF;
+	psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+	check_hr(device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(pso)));
+}
+
+double last_reload_t = 0.f;
+time_t last_mtime = {};
+void reload_shaders(ComPtr<ID3D12Device> device, ComPtr<ID3D12RootSignature> root_signature, ID3D12PipelineState** pso) {
+	if(get_time()-last_reload_t > 1.f) {
+		struct stat st;
+		stat("shader.hlsl", &st);
+		if (st.st_mtime != last_mtime) {
+			last_mtime = st.st_mtime;
+			printf("reloading shaders\n");
+			last_reload_t = get_time();
+			//(*pso)->Release();
+			create_pso(device, root_signature, pso);
+		}
+	}
+}
+
+int main() {
+	long long _freq;
+	bool has_perf_counter = QueryPerformanceFrequency((LARGE_INTEGER*)&_freq);
+	assert(has_perf_counter);
+	freq = (double)_freq;
+	QueryPerformanceCounter((LARGE_INTEGER*)&time_init);
+
+
+    //
 	// dx12 init
 	//
 
 	// create window & window class
 
-	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+	DWORD style = WS_OVERLAPPEDWINDOW;
 	int width = 1280;
 	int height = 800;
-	RECT rect;
-	SetRect(&rect, 0, 0, width, height);
+	RECT rect = { 0, 0, width, height };
 	AdjustWindowRect(&rect, style, false);
 
 	WNDCLASSA window_class;
-	window_class.style = 0;
+	window_class.style = CS_HREDRAW | CS_VREDRAW;
 	window_class.lpfnWndProc = wnd_proc;
 	window_class.cbClsExtra = 0;
 	window_class.cbWndExtra = 0;
-	window_class.hInstance = NULL;
+	window_class.hInstance = GetModuleHandle(NULL);
 	window_class.hIcon = LoadIcon(NULL, IDI_APPLICATION);
 	window_class.hCursor = LoadCursor(NULL, IDC_ARROW);
-	window_class.hbrBackground = NULL;
+	window_class.hbrBackground = (HBRUSH)COLOR_WINDOW;
 	window_class.lpszMenuName = NULL;
 	window_class.lpszClassName = "MandelbrotWindowClass";
 	RegisterClassA(&window_class);
 
-	HWND window = CreateWindowA(window_class.lpszClassName, "Mandelbrot", style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, 0, 0, NULL, 0);
+	HWND window = CreateWindowA(window_class.lpszClassName, "Mandelbrot", style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, NULL, NULL, GetModuleHandle(NULL), NULL);
 	//SetWindowLongPtr(window, GWLP_USERDATA, ...);
-	UpdateWindow(window);
+	ShowWindow(window, 1);
 
 
 	// device & swapchain
@@ -232,79 +297,8 @@ int main() {
 	device->CreateRootSignature(0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(), IID_PPV_ARGS(&root_signature));
 
 
-	// pipeline state object
-
-	static const D3D12_INPUT_ELEMENT_DESC layout[] = {
-		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
-	};
-
-	static const D3D_SHADER_MACRO macros[] = {
-		{ nullptr, nullptr }
-	};
-
-	ComPtr<ID3DBlob> vertex_shader;
-	ID3DBlob* error_blob;
-	int shader_flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_DEBUG;
-	HRESULT hr = D3DCompile(Shaders, sizeof(Shaders),
-		"", macros, nullptr,
-		"VS_main", "vs_5_0", shader_flags, 0, &vertex_shader, &error_blob);
-
-	if (FAILED(hr)) {
-		if (error_blob) {
-			printf("error compiling vs: %s\n", (char*)error_blob->GetBufferPointer());
-			error_blob->Release();
-		} else {
-			printf("unknown error compiling vs\n");
-		}
-		unreachable();
-	}
-
-	ComPtr<ID3DBlob> pixel_shader;
-	hr = D3DCompile(Shaders, sizeof(Shaders),
-		"", macros, nullptr,
-		"PS_main", "ps_5_0", shader_flags, 0, &pixel_shader, &error_blob);
-
-	if (FAILED(hr)) {
-		if (error_blob) {
-			printf("error compiling vs: %s\n", (char*)error_blob->GetBufferPointer());
-			error_blob->Release();
-		}
-		else {
-			printf("unknown error compiling vs\n");
-		}
-		unreachable();
-	}
-
-	D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-	psoDesc.VS.BytecodeLength = vertex_shader->GetBufferSize();
-	psoDesc.VS.pShaderBytecode = vertex_shader->GetBufferPointer();
-	psoDesc.PS.BytecodeLength = pixel_shader->GetBufferSize();
-	psoDesc.PS.pShaderBytecode = pixel_shader->GetBufferPointer();
-	psoDesc.pRootSignature = root_signature.Get();
-	psoDesc.NumRenderTargets = 1;
-	psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-	psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
-	psoDesc.InputLayout.NumElements = std::extent<decltype(layout)>::value;
-	psoDesc.InputLayout.pInputElementDescs = layout;
-	psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-	psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-	psoDesc.BlendState.RenderTarget[0].BlendEnable = false;
-	//psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-	//psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-	//psoDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-	//psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-	//psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
-	//psoDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-	//psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-	psoDesc.SampleDesc.Count = 1;
-	psoDesc.DepthStencilState.DepthEnable = false;
-	psoDesc.DepthStencilState.StencilEnable = false;
-	psoDesc.SampleMask = 0xFFFFFFFF;
-	psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-
-	ComPtr<ID3D12PipelineState> pso;
-	device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso));
+	ID3D12PipelineState* pso;
+	create_pso(device, root_signature, &pso);
 
 
 	// mesh buffers
@@ -419,8 +413,25 @@ int main() {
 
 
 	int current_back_buffer = 0;
-	while (true) {
+	double t = 0.f;
+	while (!should_close) {
 		wait_for_fence(frame_fences[current_back_buffer].Get(), fence_values[current_back_buffer], frame_fence_events[current_back_buffer]);
+
+		reload_shaders(device, root_signature, &pso);
+
+		MSG msg;
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+
+			if (msg.message == WM_QUIT)
+				exit(0);
+		}
+
+		double new_t = get_time();
+		double dt = new_t - t;
+		printf("frame time: %f\n", dt);
+		t = new_t;
 
 		cmd_allocators[current_back_buffer]->Reset();
 
@@ -458,7 +469,7 @@ int main() {
 		commandList->ClearRenderTargetView(renderTargetHandle, clearColor, 0, nullptr);
 
 		auto cmd_list = cmd_lists[current_back_buffer].Get();
-		cmd_list->SetPipelineState(pso.Get());
+		cmd_list->SetPipelineState(pso);
 		cmd_list->SetGraphicsRootSignature(root_signature.Get());
 		cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		cmd_list->IASetVertexBuffers(0, 1, &vertex_buffer_view);
@@ -484,8 +495,6 @@ int main() {
 		// Execute our commands
 		ID3D12CommandList* current_cmd_lists[] = { current_cmd_list };
 		queue->ExecuteCommandLists(std::extent<decltype(current_cmd_lists)>::value, current_cmd_lists);
-
-		// present
 
 		swap_chain->Present(1, 0);
 
