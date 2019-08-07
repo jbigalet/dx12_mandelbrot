@@ -150,7 +150,7 @@ int main() {
 
 	DWORD style = WS_OVERLAPPEDWINDOW;
 	int width = 1280;
-	int height = 800;
+	int height = 1280;
 	RECT rect = { 0, 0, width, height };
 	AdjustWindowRect(&rect, style, false);
 
